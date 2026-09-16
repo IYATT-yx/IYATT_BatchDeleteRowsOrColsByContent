@@ -44,73 +44,56 @@ def getUserInputKeywords():
     keywords = [kw.strip() for kw in rawKeywords if kw.strip()]
     return set(keywords)
 
-def showWarningMessage(msg):
-    """弹出警告提示框"""
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    messagebox.showwarning("选区不符合要求", msg, parent=root)
-    root.destroy()
-
-def validateSingleRowOrCol(appComHandle, targets, logger):
+def checkSingleFullRowOrCol(targets) -> bool | str:
     """
-    输入前的前置强校验：只允许【单行整行】或【单列整列】
-    返回: (isValid, deleteMode, targetItem)
-    deleteMode: 'ROW' 或 'COL'
+    注入式校验：检查用户是否选择了【单行的整行】或【单列的整列】
     """
-    # 1. 校验提取列表中是否有且仅有 1 个选区项
+    # 1. 校验提取列表中是否有且仅有 1 个选区项（替代 singleMode 的作用）
     if len(targets) != 1:
-        msg = f"选区错误：当前提取了 {len(targets)} 个选区！\n本功能仅允许选择【单行的整行】或【单列的整列】。"
-        logger.info(f"选区校验失败：提取列表中包含了 {len(targets)} 个选区，已中断。")
-        showWarningMessage(msg)
-        return False, None, None
+        return f"选区错误：当前提取了 {len(targets)} 个选区！\n请先在界面上移除多余的项，仅保留 1 个选区。"
 
     sheetName, address, mainRng = targets[0]
 
     # 2. 校验是否包含了非连续的多块区域（如按 Ctrl 多选）
     areasCount = getattr(mainRng.Areas, 'Count', 1)
     if areasCount > 1:
-        msg = f"选区错误：选区 [{address}] 包含多个离散块！\n本功能仅允许选择连续的【单行的整行】或【单列的整列】。"
-        logger.info(f"选区校验失败：选区包含 {areasCount} 个离散块，已中断。")
-        showWarningMessage(msg)
-        return False, None, None
+        return f"选区错误：选区 [{address}] 包含 {areasCount} 个离散块！\n本功能仅允许选择连续的一行或一列。"
 
-    maxRows = appComHandle.Rows.Count
-    maxCols = appComHandle.Columns.Count
+    # 3. 获取 Excel 实例的极限行列数
+    app = mainRng.Application
+    maxRows = app.Rows.Count
+    maxCols = app.Columns.Count
 
-    # 3. 校验精确尺寸：必须是“整行且仅 1 行”或“整列且仅 1 列”
+    # 4. 校验精确尺寸：必须是“整行且仅 1 行”或“整列且仅 1 列”
     isSingleFullRow = (mainRng.Columns.Count == maxCols) and (mainRng.Rows.Count == 1)
     isSingleFullCol = (mainRng.Rows.Count == maxRows) and (mainRng.Columns.Count == 1)
 
     if not isSingleFullRow and not isSingleFullCol:
-        msg = f"选区错误：当前选区 [{address}] 不符合要求！\n必须且只能选择【单行的整行】（如第 1 行）或【单列的整列】（如 A 列）。"
-        logger.info(f"选区校验失败：选区 [{address}] 行数为 {mainRng.Rows.Count}，列数为 {mainRng.Columns.Count}，不符合单行整行或单列整列条件。")
-        showWarningMessage(msg)
-        return False, None, None
+        return f"选区尺寸错误：当前选区 [{address}] 不符合要求！\n必须且只能选择【单行的整行】（如点击行号 1）或【单列的整列】（如点击列标 A）。"
 
-    deleteMode = 'ROW' if isSingleFullRow else 'COL'
-    return True, deleteMode, targets[0]
+    return True
 
 def processDelete(appComHandle, targets, logger):
     """核心业务逻辑函数"""
-    # ================= 1. 强校验：是否为“单行整行”或“单列整列” =================
-    isValid, deleteMode, targetItem = validateSingleRowOrCol(appComHandle, targets, logger)
-    if not isValid:
-        return
+    
+    # 既然代码能走到这里，说明 validator 已经 100% 确保了 targets 是单选区，且合法。
+    # 我们直接取第 0 个元素即可
+    sheetName, address, mainRng = targets[0]
+    worksheet = mainRng.Worksheet
+    totalDeleted = 0
 
-    # ================= 2. 校验彻底通过后，才弹窗获取关键词 =================
+    # 判断是行模式还是列模式（校验器已保证只会是其一）
+    deleteMode = 'ROW' if mainRng.Rows.Count == 1 else 'COL'
+
+    # 弹窗获取关键词
     targetKeywords = getUserInputKeywords()
     if not targetKeywords:
         logger.info("用户未输入有效的内容关键字或取消了输入，插件退出。")
         return
 
-    sheetName, address, mainRng = targetItem
-    worksheet = mainRng.Worksheet
-    totalDeleted = 0
-
     logger.info(f"正在分析工作表 [{sheetName}] 的选区 [{address}]...")
 
-    # 裁剪选区至 UsedRange，避免无用遍历
+    # 裁剪选区至 UsedRange，避免无用遍历（整行整列高达上百万个单元格，必须裁切）
     effectiveRng = appComHandle.Intersect(mainRng, worksheet.UsedRange)
     if effectiveRng is None:
         logger.info(f"工作表 [{sheetName}] 的选区内无有效数据，插件退出。")
@@ -162,5 +145,7 @@ def run(appComHandle, logQueue):
         pickerTitle="选单行删列 / 选单列删行（仅限选择单行整行或单列整列）", 
         actionFunc=processDelete,
         disableEvents=True,
-        manualCalc=True
+        manualCalc=True,
+        # 保持默认的 singleMode=False，避免提示语变成“提取单元格”产生歧义
+        validator=checkSingleFullRowOrCol # <--- 全靠这里的 Area、Len、Count 进行降维打击
     )
